@@ -49,7 +49,7 @@ eredis_cluster:qmn([["GET", "a"], ["GET", "b"], ["GET", "c"]]).
 eredis_cluster:transaction([["LPUSH", "a", "a"], ["LPUSH", "a", "b"], ["LPUSH", "a", "c"]]).
 
 %% Transaction Function
-Function = fun(Worker) ->
+TransactionFun = fun(Worker) ->
     eredis_cluster:qw(Worker, ["WATCH", "abc"]),
     {ok, Var} = eredis_cluster:qw(Worker, ["GET", "abc"]),
 
@@ -59,7 +59,7 @@ Function = fun(Worker) ->
     {ok, Result} = eredis_cluster:qw(Worker,[["MULTI"], ["SET", "abc", Var2], ["EXEC"]]),
     lists:last(Result)
 end,
-eredis_cluster:transaction(Function, "abc").
+eredis_cluster:transaction(TransactionFun, "abc").
 
 %% Optimistic Locking Transaction
 Function = fun(GetResult) ->
@@ -96,6 +96,35 @@ eredis_cluster:qa(["FLUSHDB"]).
 eredis_cluster:qk(["FLUSHDB"], "TEST").
 ```
 
+### Multi-cluster
+
+If you need to work with multiple Redis clusters in the same application, the
+functions `connect/3`, `disconnect/1`, `q/2`, `qk/3`, `qa/2`, `qa2/2`, `qmn/2`,
+`transaction/3`, `get_pool_by_command/2`, `get_pool_by_key/2`, `get_all_pools/1`
+accept a named cluster parameter. Multi-cluster support was added in
+eredis_cluster 0.7.0.
+
+```Erlang
+eredis_cluster:start().
+eredis_cluster:connect(mycluster, [{"127.0.0.1", 30001},
+                                   {"127.0.0.1", 30002}], []).
+
+{ok, Result} = eredis_cluster:q(mycluster, ["GET", "foo"]),
+
+%% Query on all cluster nodes
+eredis_cluster:qa(mycluster, ["FLUSHDB"]).
+
+%% Execute a query on the server containing the key "TEST"
+eredis_cluster:qk(mycluster, ["FLUSHDB"], "TEST").
+
+%% Scan one of the nodes in a cluster
+[MyclusterNode1 | _] = eredis_cluster:get_all_pools(mycluster),
+eredis_cluster:qn(["SCAN", 0, "COUNT", 10], MyclusterNode1),
+
+%% Transaction (See above for TransactionFun example)
+eredis_cluster:transaction(TransactionFun, mycluster, "abc").
+```
+
 ## Compilation and tests
 
 The directory contains a Makefile that uses rebar3.
@@ -122,9 +151,12 @@ To configure the Redis cluster client, you can use an application variable
             ]},
             {pool_size, 5},
             {pool_max_overflow, 10},
-
+            {username, "redis_user"},
             {password, "redis_pw"},
-            {socket_options, [{send_timeout, 6000}, ...]},
+            {socket_options, [{send_timeout, 500},
+                              {send_timeout_close, true},
+                              {nodelay, true},
+                              {keepalive, true}]},
             {tls, [{cacertfile, "ca.crt"}, ...]}
         ]
     }
@@ -137,8 +169,52 @@ retrieve them through the command `CLUSTER SLOTS` at runtime.
 * `init_nodes`: List of Redis nodes to fetch cluster information from. Default: `[]`
 * `pool_size`: Number of connected clients to each Redis node. Default: `10`
 * `pool_max_overflow`: Max number of extra clients that can be started when the pool is exhausted. Default: `0`
-* `password`: Password to use for a Redis cluster configured with `requirepass`. Default: `""` (i.e. AUTH not sent)
-* `socket_options`: Extra socket [options](http://erlang.org/doc/man/gen_tcp.html#type-option). Enables selecting host interface or perf. tuning. Default: `[]`
+* `username`: Username for [Redis ACL](https://redis.io/docs/manual/security/acl/) authentication.
+   Alternatives are a 0-ary function that returns the username, a string or iodata or the atom `undefined` for no username. Default: `undefined`
+
+   *Note: A 0-ary function is preferred as it prevents secrets from appearing in logs and stacktraces.*
+
+* `password`: Password for [Redis ACL](https://redis.io/docs/manual/security/acl/) authentication.
+   Alternatives are a 0-ary function that returns the password, a string or iodata or the atom `undefined` for no password. Default: `undefined`
+
+   *Note: A 0-ary function is preferred as it prevents secrets from appearing in logs and stacktraces.*
+
+* `socket_options`: Extra socket [options](http://erlang.org/doc/man/gen_tcp.html#type-option).
+   Enables selecting host interface or performance tuning. Default: `[]`.
+   However, there are some options added by default by the underlying eredis
+   client.
+
+   The socket is set to `{active, N}` with N = 10 by default.
+   This can be tuned by including `{active, N}` where N must be an integer or true.
+   Active once and false are not supported.
+
+   We suggest the following socket options, in order to efficiently
+   detect a failing connection and trigger an update of the cluster topology in
+   case of failover and other Redis Cluster events:
+
+   * `{send_timeout, Timeout}` and `{send_timeout_close, true}`: Makes sure send
+     errors are not ignored. Triggers a reconnect on send errors.
+
+   * `{nodelay, true}`: Send TCP packets immediately. A Redis command is sent as
+     a whole, not in pieces, so there is no point delaying the send.
+
+   * `{keepalive, true}`: Enables TCP keepalive. Enabled by default on Linux.
+
+   * Raw Linux-specific options can help to detect a hanging socket quickly. See
+     Linux kernel file for details: `include/uapi/linux/tcp.h`. This example
+     sets very strict values for near real-time failure detected. Consider
+     choosing values that make sense for your application:
+
+     ```Erlang
+     %% TCP_USER_TIMEOUT (in milliseconds); should be > TCP_KEEPIDLE if
+     %% keepalive is enabled:
+     {raw, 6, 18, <<1100:32/native>>},
+     %% {keepalive, true} must be set for these to take effect:
+     {raw, 6, 4, <<1:32/native>>},  % TCP_KEEPIDLE (in seconds)
+     {raw, 6, 5, <<1:32/native>>},  % TCP_KEEPINTVL (in seconds)
+     {raw, 6, 6, <<1:32/native>>}   % TCP_KEEPCNT
+     ```
+
 * `tls`: Enable TLS/SSL and use specified [TLSOptions](https://erlang.org/doc/man/ssl.html#type-client_option). Default: TLS not enabled.
 
 ### Configuring via API

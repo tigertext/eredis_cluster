@@ -3,18 +3,20 @@ on:
   push:
   pull_request:
     branches:
-      # Branches from forks have the form 'user:branch-name' so we only run
-      # this job on pull_request events for branches that look like fork
-      # branches. Without this we would end up running this job twice for non
-      # forked PRs, once for the push and then once for opening the PR.
-      - '**:**'
+      - master
 
 jobs:
   ci:
     strategy:
       matrix:
-        include:
-          - otp-version: 23.1
+        include: # See https://www.erlang-solutions.com/downloads/
+          - otp-version: 25.0.3
+            platform: ubuntu-20.04
+            lsb_release: focal
+          - otp-version: 24.3.3
+            platform: ubuntu-20.04
+            lsb_release: focal
+          - otp-version: 23.3.4.5
             platform: ubuntu-20.04
             lsb_release: focal
           - otp-version: 22.3.4.9
@@ -48,9 +50,16 @@ jobs:
           curl -f https://packages.erlang-solutions.com/erlang/debian/pool/$DEB_NAME -o $DEB_NAME
           sudo dpkg --install $DEB_NAME
 
+      - name: Install compatible rebar3 version
+        if: ${{ startsWith(matrix.otp-version, '21.') || startsWith(matrix.otp-version, '22.') }}
+        run: |
+          git clone https://github.com/erlang/rebar3.git
+          cd rebar3 && git checkout 3.15.2 && ./bootstrap && ./rebar3 local install
+          echo "$HOME/.cache/rebar3/bin" >> $GITHUB_PATH
+
       - name: Install elvis
         run: |
-          git clone --depth 1 --branch 0.5.0 https://github.com/inaka/elvis.git
+          git clone --depth 1 --branch 1.1.0 https://github.com/inaka/elvis.git
           cd elvis && rebar3 escriptize && sudo cp _build/default/bin/elvis /usr/local/bin/
 
       - name: Build and test

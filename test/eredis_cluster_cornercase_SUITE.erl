@@ -17,7 +17,7 @@ all() ->
 init_per_testcase(_Tc, Config) ->
     {ok, ListenSocket} = gen_tcp:listen(0, [binary, {active, false}]),
     {ok, {_, Port}} = inet:sockname(ListenSocket),
-    ok = application:start(eredis_cluster),
+    {ok, _} = application:ensure_all_started(eredis_cluster),
     spawn_link(fun() ->
                        eredis_cluster:connect([{"127.0.0.1", Port}],
                                               [{pool_size, 1},
@@ -70,7 +70,7 @@ update_key_all_retries_fail_server(Sock) ->
                           handle_watch_get_multi_set_exec(Sock, <<"foo">>,
                                                           Get, ExpectSet, fail)
                   end,
-                  lists:seq(1, ?OL_TRANSACTION_TTL + 1)).
+                  lists:seq(1, ?optimistic_locking_transaction_max_retries + 1)).
 
 handle_watch_get_multi_set_exec(Sock, Key, GetValue, ExpectSet, FailOrPass) ->
     {ok, WatchKey} = gen_tcp:recv(Sock, 0),

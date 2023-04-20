@@ -1,6 +1,28 @@
 Change log
 ==========
 
+0.9.0
+-----
+
+* Update eredis to 1.7.0
+
+0.8.0
+-----
+
+* Update eredis to 1.5.1
+
+0.7.0
+-----
+
+* Support multiple clusters
+* List runtime dependencies in .app.src
+
+0.6.1
+-----
+
+* Let [Eredis](https://github.com/Nordix/eredis) version to be 1.4 to 2.0 on mix and 1.4.1 on rebar
+* Update CI jobs and generate TLS test certs on the fly to avoid outdated test certs
+
 0.6.0
 -----
 
