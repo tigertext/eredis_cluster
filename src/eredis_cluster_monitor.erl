@@ -535,3 +535,33 @@ terminate(_Reason, _State) ->
 %% @private
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+%% @private
+-spec parse_cluster_nodes(ClusterNodes :: [[bitstring()]], Options :: options()) ->
+          [#node{}].
+parse_cluster_nodes(ClusterNodes, Options) ->
+    lists:map(fun([Id, Address, Flags, MasterId, _PingSent, _PongRecv,
+                   _ConfigEpoch, _LinkState | _Slots]) ->
+                      [Host, Port] = binary:split(Address, <<":">>),
+                      IsReplica = lists:member(<<"slave">>, Flags),
+                      #node{
+                          address = binary_to_list(Host),
+                          port = binary_to_integer(Port),
+                          options = Options,
+                          is_replica = IsReplica,
+                          master_id = binary_to_list(MasterId)
+                      }
+              end, ClusterNodes).
+
+%% @private
+-spec get_node_by_pool(State :: #state{}, Pool :: atom()) -> {ok, #node{}} | {error, not_found}.
+get_node_by_pool(State, Pool) ->
+    SlotsMapList = tuple_to_list(State#state.slots_maps),
+    case lists:search(fun(SlotsMap) ->
+        SlotsMap#slots_map.node#node.pool =:= Pool
+    end, SlotsMapList) of
+        {value, SlotsMap} ->
+            {ok, SlotsMap#slots_map.node};
+        false ->
+            {error, not_found}
+    end.

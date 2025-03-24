@@ -595,14 +595,92 @@ split_by_pools([], _Index, CmdAcc, MapAcc, State) ->
     MapAcc2 = [{Pool, lists:reverse(Mapping)} || {Pool, Mapping} <- MapAcc],
     {CmdAcc2, MapAcc2, eredis_cluster_monitor:get_state_version(State)}.
 
+%% @private
+-spec query(Cluster :: atom(), Command :: redis_command()) -> redis_result().
 query(Cluster, Command) ->
-    PoolKey = get_key_from_command(Command),
-    query(Cluster, Command, PoolKey).
+    Slot = get_key_from_command(Command),
+    query(Cluster, Command, Slot).
 
-query(_Cluster, _Command, undefined) ->
-    {error, invalid_cluster_command};
-query(Cluster, Command, PoolKey) ->
-    query(Cluster, Command, PoolKey, 0).
+%% @private
+-spec query(Cluster :: atom(), Command :: redis_command(), Key :: anystring()) ->
+          redis_result().
+query(Cluster, Command, Key) ->
+    Slot = get_key_slot(Key),
+    CommandType = get_command_type(Command),
+    query_retry_loop(Cluster, Command, Slot, CommandType, 0).
+
+%% @private
+-spec query_retry_loop(Cluster :: atom(), Command :: redis_command(),
+                      Slot :: integer(), CommandType :: command_type(),
+                      RetryCounter :: integer()) -> redis_result().
+query_retry_loop(_Cluster, _Command, _Slot, _CommandType,
+                 ?redis_cluster_request_max_retries) ->
+    {error, no_connection};
+query_retry_loop(Cluster, Command, Slot, CommandType, Counter) ->
+    throttle_retries(Counter),
+    State = eredis_cluster_monitor:get_state(Cluster),
+    Version = eredis_cluster_monitor:get_state_version(State),
+    
+    %% Get the master node for the slot
+    {MasterPool, _} = eredis_cluster_monitor:get_pool_by_slot(Slot, State),
+    
+    %% For read commands, try to find a replica
+    Pool = case CommandType of
+        read ->
+            case find_replica_pool(State, MasterPool) of
+                undefined -> MasterPool;
+                ReplicaPool -> ReplicaPool
+            end;
+        _ ->
+            MasterPool
+    end,
+    
+    case Pool of
+        undefined ->
+            eredis_cluster_monitor:refresh_mapping(Cluster, Version),
+            query_retry_loop(Cluster, Command, Slot, CommandType, Counter + 1);
+        _ ->
+            Transaction = fun(Worker) -> qw(Worker, Command) end,
+            Result = eredis_cluster_pool:transaction(Pool, Transaction),
+            case handle_transaction_result(Result, Cluster, Version) of
+                retry ->
+                    query_retry_loop(Cluster, Command, Slot, CommandType, Counter + 1);
+                Result ->
+                    Result
+            end
+    end.
+
+%% @private
+-spec find_replica_pool(State :: #state{}, MasterPool :: atom()) -> atom() | undefined.
+find_replica_pool(State, MasterPool) ->
+    %% Get all pools
+    Pools = eredis_cluster_monitor:get_all_pools(State),
+    
+    %% Find the master node
+    MasterNode = lists:foldl(fun(Pool, Acc) ->
+        case eredis_cluster_monitor:get_node_by_pool(State, Pool) of
+            {ok, Node} when Node#node.pool =:= MasterPool ->
+                Node;
+            _ ->
+                Acc
+        end
+    end, undefined, Pools),
+    
+    case MasterNode of
+        undefined ->
+            undefined;
+        _ ->
+            %% Find a replica for this master
+            lists:foldl(fun(Pool, Acc) ->
+                case eredis_cluster_monitor:get_node_by_pool(State, Pool) of
+                    {ok, Node} when Node#node.is_replica andalso
+                                   Node#node.master_id =:= MasterNode#node.master_id ->
+                        Node#node.pool;
+                    _ ->
+                        Acc
+                end
+            end, undefined, Pools)
+    end.
 
 query_noreply(_Cluster, _Command, undefined) ->
     {error, invalid_cluster_command};
@@ -1158,6 +1236,57 @@ memory_arg([Subcommand | Args]) ->
     case string:to_lower(Subcommand) of
         "usage" -> nth_arg(1, Args);
         _Other  -> undefined
+    end.
+
+%% @private
+-spec get_command_type(Command :: redis_command()) -> command_type().
+get_command_type(Command) ->
+    Cmd = case is_list(Command) of
+        true -> hd(Command);
+        false -> Command
+    end,
+    CmdStr = string:to_lower(binary_to_list(Cmd)),
+    case CmdStr of
+        "get" -> read;
+        "mget" -> read;
+        "hget" -> read;
+        "hgetall" -> read;
+        "lrange" -> read;
+        "zrange" -> read;
+        "zrevrange" -> read;
+        "scan" -> read;
+        "hscan" -> read;
+        "sscan" -> read;
+        "zscan" -> read;
+        "keys" -> read;
+        "exists" -> read;
+        "type" -> read;
+        "ttl" -> read;
+        "pttl" -> read;
+        "llen" -> read;
+        "scard" -> read;
+        "zcard" -> read;
+        "hlen" -> read;
+        "strlen" -> read;
+        "set" -> write;
+        "mset" -> write;
+        "hset" -> write;
+        "hmset" -> write;
+        "lpush" -> write;
+        "rpush" -> write;
+        "zadd" -> write;
+        "del" -> write;
+        "expire" -> write;
+        "pexpire" -> write;
+        "rename" -> write;
+        "move" -> write;
+        "flushdb" -> admin;
+        "flushall" -> admin;
+        "config" -> admin;
+        "cluster" -> admin;
+        "info" -> admin;
+        "ping" -> admin;
+        _ -> write %% Default to write for unknown commands
     end.
 
 -ifdef(TEST).
