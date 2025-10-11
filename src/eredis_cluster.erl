@@ -23,10 +23,17 @@
 
 %% Generic redis call (default cluster)
 -export([q/1, qk/2, q_noreply/1, qp/1, qa/1, qa2/1, qn/2, qw/2, qmn/1]).
+-export([q/1, qk/2, q_noreply/1, qp/1, qa/1, qa2/1, qn/2, qw/2, qmn/1]).
+-export([q_read/1, qk_read/2]).
+ -export([q_read/1, qk_read/2]).
+ -export([q_auto/1, qk_auto/2]).
 -export([transaction/1, transaction/2]).
 
 %% Commands to named cluster
 -export([q/2, qk/3, qa/2, qa2/2, qmn/2]).
+-export([q_read/2, qk_read/3]).
+ -export([q_read/2, qk_read/3]).
+ -export([q_auto/2, qk_auto/3]).
 -export([transaction/3]).
 
 %% Specific redis command implementation (default cluster)
@@ -599,10 +606,107 @@ query(Cluster, Command) ->
     PoolKey = get_key_from_command(Command),
     query(Cluster, Command, PoolKey).
 
+%% Read routing APIs (replica-preferred)
+-spec q_read(Command::redis_command()) -> redis_result().
+q_read(Command) ->
+    q_read(?default_cluster, Command).
+
+-spec q_read(Cluster :: atom(), Command :: redis_command()) -> redis_result().
+q_read(Cluster, Command) ->
+    PoolKey = get_key_from_command(Command),
+    qk_read(Cluster, Command, PoolKey).
+
+%% Auto route: decide read vs write based on command name; honor force_master_reads config
+-spec q_auto(Command::redis_command()) -> redis_result().
+q_auto(Command) ->
+    q_auto(?default_cluster, Command).
+
+-spec q_auto(Cluster :: atom(), Command :: redis_command()) -> redis_result().
+q_auto(Cluster, Command) ->
+    case should_force_master_reads(Cluster) of
+        true -> q(Cluster, Command);
+        false ->
+            case is_read_command(Command) of
+                true -> q_read(Cluster, Command);
+                false -> q(Cluster, Command)
+            end
+    end.
+
+-spec qk_auto(Command::redis_command(), Key::anystring()) -> redis_result().
+qk_auto(Command, Key) ->
+    qk_auto(?default_cluster, Command, Key).
+
+-spec qk_auto(Cluster :: atom(), Command :: redis_command(), Key :: anystring()) -> redis_result().
+qk_auto(Cluster, Command, Key) ->
+    case should_force_master_reads(Cluster) of
+        true -> qk(Cluster, Command, Key);
+        false ->
+            case is_read_command(Command) of
+                true -> qk_read(Cluster, Command, Key);
+                false -> qk(Cluster, Command, Key)
+            end
+    end.
+
+-spec qk_read(Command::redis_command(), Key::anystring()) -> redis_result().
+qk_read(Command, Key) ->
+    qk_read(?default_cluster, Command, Key).
+
+-spec qk_read(Cluster :: atom(), Command :: redis_command(), Key :: anystring()) ->
+          redis_result().
+qk_read(Cluster, Command, Key) ->
+    read_query(Cluster, Command, Key, 0).
+
 query(_Cluster, _Command, undefined) ->
     {error, invalid_cluster_command};
 query(Cluster, Command, PoolKey) ->
     query(Cluster, Command, PoolKey, 0).
+
+read_query(_Cluster, _Command, undefined, _Counter) ->
+    {error, invalid_cluster_command};
+read_query(_Cluster, _Command, _Key, ?redis_cluster_request_max_retries) ->
+    {error, no_connection};
+read_query(Cluster, Command, Key, Counter) ->
+    throttle_retries(Counter),
+    Slot = get_key_slot(Key),
+    State = eredis_cluster_monitor:get_state(Cluster),
+    {Pool, Version} = eredis_cluster_monitor:get_read_pool_by_slot(Slot, State),
+    Transaction = fun(W) ->
+        case Command of
+            [[X|_]|_] when is_list(X); is_binary(X) ->
+                eredis:qp(W, [["READONLY"] | Command]);
+            _ ->
+                eredis:qp(W, [["READONLY"], Command])
+        end
+    end,
+    Result0 = eredis_cluster_pool:transaction(Pool, Transaction),
+    Result = handle_redirects(Cluster, Command, Result0, Version),
+    case handle_transaction_result(Result, Cluster, Version) of
+        retry -> read_query(Cluster, Command, Key, Counter + 1);
+        Result -> Result
+    end.
+
+%% Determines if reads should be forced to master for a cluster
+should_force_master_reads(Cluster) ->
+    application:get_env(eredis_cluster, {Cluster, force_master_reads},
+        application:get_env(eredis_cluster, force_master_reads, false)).
+
+%% Simple read command classifier: extend as needed
+is_read_command([[X|_]|_]) when is_list(X); is_binary(X) ->
+    is_read_command([X]);
+is_read_command([Name | _]) when is_bitstring(Name) ->
+    is_read_command([bitstring_to_list(Name)]);
+is_read_command([Name | _]) when is_list(Name) ->
+    Lower = string:to_lower(Name),
+    lists:member(Lower, [
+        "get","mget","hget","hgetall","hexists","hlen","hmget",
+        "zrange","zrevrange","zrangebyscore","zrevrangebyscore","zcard",
+        "zscore","zrank","zrevrank","scard","sismember","smembers",
+        "exists","ttl","pttl","type","getrange","strlen","lrange",
+        "xrange","xrevrange","xlen","xinfo","xread","xreadgroup",
+        "keys","scan","sscan","hscan","zscan","dbsize","ping",
+        "info","time","role","cluster","command","memory","echo"
+    ]);
+is_read_command(_) -> false.
 
 query_noreply(_Cluster, _Command, undefined) ->
     {error, invalid_cluster_command};

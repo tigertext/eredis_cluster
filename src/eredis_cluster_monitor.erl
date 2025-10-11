@@ -14,6 +14,7 @@
 -export([refresh_mapping/2, async_refresh_mapping/2]).
 -export([get_state/1, get_state_version/1]).
 -export([get_pool_by_slot/1, get_pool_by_slot/2]).
+-export([get_read_pool_by_slot/1, get_read_pool_by_slot/2]).
 -export([get_all_pools/0, get_all_pools/1]).
 -export([get_cluster_slots/1, get_cluster_nodes/1]).
 
@@ -121,6 +122,43 @@ get_pool_by_slot(Slot, State) ->
         _:_ ->
             {undefined, State#state.version}
     end.
+
+%% @private
+-spec get_read_pool_by_slot(Slot :: integer()) ->
+    {PoolName :: atom() | undefined, Version :: integer()}.
+get_read_pool_by_slot(Slot) ->
+    State = get_state(?default_cluster),
+    get_read_pool_by_slot(Slot, State).
+
+%% @private
+-spec get_read_pool_by_slot(Slot :: integer(), State :: #state{}) ->
+    {PoolName :: atom() | undefined, Version :: integer()}.
+get_read_pool_by_slot(Slot, State) ->
+    try
+        [{_, Index}] = ets:lookup(State#state.slots_table, Slot),
+        SlotsMap = element(Index, State#state.slots_maps),
+        Replicas = case SlotsMap#slots_map.replicas of
+                       undefined -> [];
+                       R -> R
+                   end,
+        case get_first_connected_pool(Replicas) of
+            undefined ->
+                case SlotsMap#slots_map.node of
+                    #node{pool = Pool} when is_atom(Pool) -> {Pool, State#state.version};
+                    _ -> {undefined, State#state.version}
+                end;
+            Pool -> {Pool, State#state.version}
+        end
+    catch
+        _:_ -> {undefined, State#state.version}
+    end.
+
+get_first_connected_pool([#node{pool = Pool} | _]) when is_atom(Pool) ->
+    Pool;
+get_first_connected_pool([_ | T]) ->
+    get_first_connected_pool(T);
+get_first_connected_pool([]) ->
+    undefined.
 
 %% =============================================================================
 %% @doc Connect to a init node and get the slot distribution of nodes.
@@ -350,11 +388,18 @@ get_cluster_slots_from_single_node(Node) ->
                           Options::options()) -> [#slots_map{}].
 parse_cluster_slots(ClusterInfo, Options) ->
     SlotsMaps = parse_cluster_slots(ClusterInfo, 1, []),
-    %% Save current options in each new SlotsMaps
-    [SlotsMap#slots_map{node=SlotsMap#slots_map.node#node{options = Options}} ||
-                       SlotsMap <- SlotsMaps].
+    %% Save current options in each new SlotsMaps (master and replicas)
+    [SlotsMap#slots_map{
+         node = SlotsMap#slots_map.node#node{options = Options},
+         replicas = case SlotsMap#slots_map.replicas of
+                        undefined -> undefined;
+                        Rs -> [R#node{options = Options} || R <- Rs]
+                    end
+     } || SlotsMap <- SlotsMaps].
 
-parse_cluster_slots([[StartSlot, EndSlot | [[Address, Port | _] | _]] | T], Index, Acc) ->
+parse_cluster_slots([[StartSlot, EndSlot | [[Address, Port | _] | ReplicasInfo]] | T], Index, Acc) ->
+    Replicas = [#node{address = binary_to_list(RAddr),
+                      port = binary_to_integer(RPort)} || [RAddr, RPort | _] <- ReplicasInfo],
     SlotsMap =
         #slots_map{
             index = Index,
@@ -363,7 +408,8 @@ parse_cluster_slots([[StartSlot, EndSlot | [[Address, Port | _] | _]] | T], Inde
             node = #node{
                 address = binary_to_list(Address),
                 port = binary_to_integer(Port)
-            }
+            },
+            replicas = Replicas
         },
     parse_cluster_slots(T, Index + 1, [SlotsMap | Acc]);
 parse_cluster_slots([], _Index, Acc) ->
@@ -442,9 +488,14 @@ create_slots_cache(SlotsTable, SlotsMaps) ->
 
 -spec connect_all_slots(pid(), [#slots_map{}]) -> [#slots_map{}].
 connect_all_slots(PoolSup, SlotsMapList) ->
-    [SlotsMap#slots_map{node = connect_node(PoolSup,
-                                            SlotsMap#slots_map.node)} ||
-        SlotsMap <- SlotsMapList].
+    [begin
+         Master1 = connect_node(PoolSup, SlotsMap#slots_map.node),
+         Replicas1 = case SlotsMap#slots_map.replicas of
+                         undefined -> undefined;
+                         Rs -> [connect_node(PoolSup, R) || R <- Rs]
+                     end,
+         SlotsMap#slots_map{node = Master1, replicas = Replicas1}
+     end || SlotsMap <- SlotsMapList].
 
 -spec connect_([{Address :: string(), Port :: integer()}],
                Options :: options(), State :: #state{}) -> #state{}.

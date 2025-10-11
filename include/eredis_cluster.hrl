@@ -37,7 +37,8 @@
     start_slot :: integer(),
     end_slot :: integer(),
     index :: integer(),
-    node :: #node{}
+    node :: #node{},
+    replicas :: [#node{}] | undefined
 }).
 
 -define(default_cluster, eredis_cluster_default).

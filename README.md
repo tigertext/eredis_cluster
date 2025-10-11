@@ -94,6 +94,22 @@ eredis_cluster:qa(["FLUSHDB"]).
 
 %% Execute a query on the server containing the key "TEST"
 eredis_cluster:qk(["FLUSHDB"], "TEST").
+
+%% Replica-preferred reads (will send READONLY and route to replicas if available)
+%% Single command read using inferred key
+eredis_cluster:q_read(["GET", "abc"]).
+
+%% Single command read with explicit key
+eredis_cluster:qk_read(["GET", "abc"], "abc").
+
+%% Named cluster variants
+eredis_cluster:q_read(mycluster, ["GET", "foo"]),
+eredis_cluster:qk_read(mycluster, ["GET", "foo"], "foo").
+
+%% Automatic routing helper (read vs write) with optional cluster-wide override
+%% Auto decides from command name whether it's a read (uses replicas) or write (master)
+eredis_cluster:q_auto(["GET", "abc"]).
+eredis_cluster:qk_auto(["GET", "abc"], "abc").
 ```
 
 ### Multi-cluster
@@ -229,6 +245,12 @@ application:set_env(eredis_cluster, socket_options, [{send_timeout, 6000}]),
 application:set_env(eredis_cluster, tls, [{cacertfile, "ca.crt"},
                                           {certfile, "client.crt"},
                                           {keyfile, "client.key"}]),
+
+%% Force master-only reads globally (optional; default false)
+application:set_env(eredis_cluster, force_master_reads, true),
+
+%% Or force master-only reads per named cluster (overrides global)
+application:set_env(eredis_cluster, {mycluster, force_master_reads}, true),
 
 %% Set initial nodes and perform a controlled connect
 eredis_cluster:connect([{"127.0.0.1", 30001},
